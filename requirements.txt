@@ -5,5 +5,5 @@ matplotlib
 scipy
 scikit-learn
 plotly
-math
+#math
 #warnings
