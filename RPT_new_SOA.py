@@ -130,6 +130,7 @@ with st.sidebar:
         st.session_state.example_data = example_data
         st.session_state.use_example_data = True
         st.session_state.uploaded_file = None
+        st.rerun()
     
     st.markdown("---")
     st.markdown("## ⚙️ Analysis Parameters")
@@ -461,7 +462,7 @@ class NovelRockPhysicsGasDetector:
         n_samples = len(self.data)
         prob = np.zeros(n_samples)
         
-        if 'Ip' not in self.data.columns or 'Vp_Vs' not in self.data.columns:
+        if 'Vp_Vs' not in self.data.columns:
             return prob
         
         # Calculate distance to gas trend
@@ -493,7 +494,7 @@ class NovelRockPhysicsGasDetector:
             features_list = []
             feature_names = []
             
-            # Basic features
+            # Basic features - check each one exists
             basic_features = ['Vp', 'Vs', 'RHO', 'Vp_Vs', 'Ip', 'LAMBDA_RHO', 'MU_RHO']
             for feat in basic_features:
                 if feat in self.data.columns:
@@ -539,6 +540,14 @@ class NovelRockPhysicsGasDetector:
                     # Use simple Vp/Vs based probability
                     prob = np.clip(1.8 - vp_vs_ratio, 0, 1)
                     return prob
+            else:
+                # If we don't have the columns for heuristic, skip ML
+                st.warning("Missing columns for ML training. Using Vp/Vs method.")
+                if 'Vp_Vs' in self.data.columns:
+                    vp_vs_ratio = self.data['Vp_Vs'].values
+                    return np.clip(1.8 - vp_vs_ratio, 0, 1)
+                else:
+                    return np.zeros(n_samples)
             
             # Train Random Forest
             rf = RandomForestClassifier(
@@ -549,11 +558,22 @@ class NovelRockPhysicsGasDetector:
             )
             
             # Only train if we have enough labeled samples
-            if 'train_mask' in locals() and np.sum(train_mask) >= 20:
+            if np.sum(train_mask) >= 20:
                 rf.fit(X[train_mask], y[train_mask])
                 
-                # Predict probabilities
-                prob = rf.predict_proba(X)[:, 1]
+                # Predict probabilities - handle both binary and multi-class
+                if hasattr(rf, 'predict_proba'):
+                    proba = rf.predict_proba(X)
+                    # Check shape of proba
+                    if len(proba.shape) == 2 and proba.shape[1] > 1:
+                        # Multi-class case
+                        prob = proba[:, 1]  # Probability of class 1 (gas)
+                    else:
+                        # Binary case or single class
+                        prob = proba.flatten()
+                else:
+                    # If predict_proba not available, use decision function
+                    prob = rf.predict(X)
             else:
                 # Fallback to simple method
                 if 'vp_vs_ratio' in locals():
@@ -623,18 +643,29 @@ class NovelRockPhysicsGasDetector:
                     method_probs.append(prob2)
                     method_names.append("Lambda-Rho")
                     uncertainties.append(0.15)
+                else:
+                    # Add placeholder if column doesn't exist
+                    prob2 = np.zeros(n_samples)
+                    method_probs.append(prob2)
+                    method_names.append("Lambda-Rho")
+                    uncertainties.append(0.15)
             
             # Method 3: Adaptive DEM
             with st.spinner("Running Adaptive DEM..."):
                 prob3 = np.zeros(n_samples)
-                for i in range(min(n_samples, 1000)):  # Limit for performance
-                    if i < len(clusters) and clusters[i] < len(aspect_ratios):
-                        ar_set = aspect_ratios[clusters[i]]
+                # Limit calculations for performance
+                calc_samples = min(n_samples, 1000)
+                step = max(1, n_samples // 1000)
+                
+                indices = range(0, n_samples, step)
+                for idx in indices:
+                    if idx < len(clusters) and clusters[idx] < len(aspect_ratios):
+                        ar_set = aspect_ratios[clusters[idx]]
                     else:
                         ar_set = [0.1, 0.3, 0.6]
                     
-                    phi = self.data.iloc[i]['PHI'] if i < len(self.data) else 0.2
-                    Sw = self.data.iloc[i]['SW'] if 'SW' in self.data.columns and i < len(self.data) else 1.0
+                    phi = self.data.iloc[idx]['PHI'] if idx < len(self.data) else 0.2
+                    Sw = self.data.iloc[idx]['SW'] if 'SW' in self.data.columns and idx < len(self.data) else 1.0
                     
                     # Simplified DEM calculation
                     vp_water, _, _ = self.differential_effective_medium(37, 44, phi, ar_set, 1.0)
@@ -642,7 +673,16 @@ class NovelRockPhysicsGasDetector:
                     
                     if vp_water > 0:
                         velocity_drop = (vp_water - vp_current) / vp_water
-                        prob3[i] = np.clip(velocity_drop * 3, 0, 1)
+                        prob3[idx] = np.clip(velocity_drop * 3, 0, 1)
+                
+                # Fill in missing values
+                if step > 1:
+                    # Interpolate for skipped samples
+                    from scipy import interpolate
+                    x = np.array(list(indices))
+                    y = prob3[x]
+                    f = interpolate.interp1d(x, y, kind='linear', bounds_error=False, fill_value=0)
+                    prob3 = f(np.arange(n_samples))
                 
                 method_probs.append(prob3)
                 method_names.append("Adaptive DEM")
@@ -1230,33 +1270,27 @@ def main():
                         status_text.text("Step 3/5: Running multi-model detection...")
                         progress_bar.progress(60)
                         
-                        # Get parameters from sidebar (they should be in scope)
-                        # We'll use default values if not available
-                        use_dispersion_val = True
-                        use_ml_val = True
-                        confidence_threshold_val = 0.7
-                        n_clusters_val = 3
-                        
-                        # Try to get from sidebar widgets (if they exist)
+                        # Get parameters from sidebar widgets
+                        # Use try-except to handle any missing variables
                         try:
                             use_dispersion_val = use_dispersion
-                        except:
-                            pass
+                        except NameError:
+                            use_dispersion_val = True
                         
                         try:
                             use_ml_val = use_ml
-                        except:
-                            pass
+                        except NameError:
+                            use_ml_val = True
                         
                         try:
                             confidence_threshold_val = confidence_threshold
-                        except:
-                            pass
+                        except NameError:
+                            confidence_threshold_val = 0.7
                         
                         try:
                             n_clusters_val = n_clusters
-                        except:
-                            pass
+                        except NameError:
+                            n_clusters_val = 3
                         
                         gas_prob, confidence = st.session_state.detector.multi_model_gas_detection(
                             use_dispersion=use_dispersion_val,
@@ -1284,7 +1318,7 @@ def main():
                 # Get confidence threshold
                 try:
                     confidence_threshold_val = confidence_threshold
-                except:
+                except NameError:
                     confidence_threshold_val = 0.7
                 
                 create_dashboard(st.session_state.detector, confidence_threshold_val)
