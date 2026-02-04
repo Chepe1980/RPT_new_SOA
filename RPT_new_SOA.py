@@ -78,19 +78,33 @@ if 'analysis_run' not in st.session_state:
     st.session_state.analysis_run = False
 if 'data_loaded' not in st.session_state:
     st.session_state.data_loaded = False
+if 'uploaded_file' not in st.session_state:
+    st.session_state.uploaded_file = None
+if 'example_data' not in st.session_state:
+    st.session_state.example_data = None
+if 'use_example_data' not in st.session_state:
+    st.session_state.use_example_data = False
+if 'run_analysis' not in st.session_state:
+    st.session_state.run_analysis = False
 
 # Sidebar
 with st.sidebar:
     st.markdown("## 📊 Data Input")
     
+    # File uploader - store in session state
     uploaded_file = st.file_uploader(
         "Upload Well Log CSV File", 
         type=['csv'],
         help="Upload CSV file with columns: Vp, Vs, RHO, PHI, GR, RT, VCLAY, SW, DEPTH"
     )
     
+    # Store uploaded file in session state
+    if uploaded_file is not None:
+        st.session_state.uploaded_file = uploaded_file
+        st.session_state.use_example_data = False
+    
     # Example data button
-    if st.button("Load Example Data", use_container_width=True):
+    if st.button("📊 Load Example Data", use_container_width=True):
         # Create synthetic example data
         np.random.seed(42)
         n_samples = 500
@@ -115,7 +129,7 @@ with st.sidebar:
         # Save to session state
         st.session_state.example_data = example_data
         st.session_state.use_example_data = True
-        st.rerun()
+        st.session_state.uploaded_file = None
     
     st.markdown("---")
     st.markdown("## ⚙️ Analysis Parameters")
@@ -177,9 +191,7 @@ with st.sidebar:
     
     if st.button("🚀 Run Full Analysis", type="primary", use_container_width=True):
         st.session_state.run_analysis = True
-    else:
-        if 'run_analysis' not in st.session_state:
-            st.session_state.run_analysis = False
+        st.rerun()
 
 # Main content - Novel Rock Physics Class
 class NovelRockPhysicsGasDetector:
@@ -537,14 +549,17 @@ class NovelRockPhysicsGasDetector:
             )
             
             # Only train if we have enough labeled samples
-            if np.sum(train_mask) >= 20:
+            if 'train_mask' in locals() and np.sum(train_mask) >= 20:
                 rf.fit(X[train_mask], y[train_mask])
                 
                 # Predict probabilities
                 prob = rf.predict_proba(X)[:, 1]
             else:
                 # Fallback to simple method
-                prob = np.clip(1.8 - vp_vs_ratio, 0, 1)
+                if 'vp_vs_ratio' in locals():
+                    prob = np.clip(1.8 - vp_vs_ratio, 0, 1)
+                else:
+                    prob = np.zeros(n_samples)
             
             return np.clip(prob, 0, 1)
             
@@ -733,7 +748,7 @@ class NovelRockPhysicsGasDetector:
         self.results['statistics'] = stats
         return stats
 
-def create_dashboard(detector):
+def create_dashboard(detector, confidence_threshold):
     """Create interactive dashboard."""
     
     # Create tabs
@@ -1140,27 +1155,35 @@ def create_dashboard(detector):
 def main():
     """Main Streamlit app."""
     
-    # Check if we should use example data
-    if hasattr(st.session_state, 'use_example_data') and st.session_state.use_example_data:
-        uploaded_file = None
-        example_data = st.session_state.example_data
-    else:
-        example_data = None
+    # Check if we have data to load
+    data_available = False
     
-    # Main content based on file upload
-    if uploaded_file is not None or example_data is not None:
+    # Check for uploaded file
+    if st.session_state.uploaded_file is not None:
+        data_available = True
+        data_source = "uploaded"
+        data_to_load = st.session_state.uploaded_file
+    
+    # Check for example data
+    elif st.session_state.use_example_data and st.session_state.example_data is not None:
+        data_available = True
+        data_source = "example"
+        data_to_load = st.session_state.example_data
+    
+    # Main content based on data availability
+    if data_available:
         # Load and process data
         with st.spinner("Loading and processing data..."):
             try:
                 if st.session_state.detector is None:
                     st.session_state.detector = NovelRockPhysicsGasDetector()
                 
-                if uploaded_file is not None:
-                    df = pd.read_csv(uploaded_file)
+                if data_source == "uploaded":
+                    df = pd.read_csv(data_to_load)
                     st.session_state.detector.load_data(df)
                     st.success(f"✅ Data loaded successfully: {len(st.session_state.detector.data):,} samples")
-                elif example_data is not None:
-                    st.session_state.detector.load_data(example_data)
+                elif data_source == "example":
+                    st.session_state.detector.load_data(data_to_load)
                     st.success(f"✅ Example data loaded: {len(st.session_state.detector.data):,} samples")
                 
                 st.session_state.data_loaded = True
@@ -1168,6 +1191,7 @@ def main():
             except Exception as e:
                 st.error(f"Error loading data: {str(e)}")
                 st.session_state.data_loaded = False
+                return
         
         # Show data info if loaded
         if st.session_state.data_loaded and st.session_state.detector is not None:
@@ -1189,7 +1213,7 @@ def main():
                 for i in range(0, len(cols), cols_per_row):
                     st.code(" | ".join(cols[i:i+cols_per_row]))
             
-            # Run analysis button or auto-run if requested
+            # Run analysis if requested
             if st.session_state.run_analysis:
                 with st.spinner("Running advanced gas detection analysis..."):
                     # Create progress indicators
@@ -1206,11 +1230,33 @@ def main():
                         status_text.text("Step 3/5: Running multi-model detection...")
                         progress_bar.progress(60)
                         
-                        # Get parameters from sidebar
-                        use_dispersion_val = use_dispersion if 'use_dispersion' in locals() else True
-                        use_ml_val = use_ml if 'use_ml' in locals() else True
-                        confidence_threshold_val = confidence_threshold if 'confidence_threshold' in locals() else 0.7
-                        n_clusters_val = n_clusters if 'n_clusters' in locals() else 3
+                        # Get parameters from sidebar (they should be in scope)
+                        # We'll use default values if not available
+                        use_dispersion_val = True
+                        use_ml_val = True
+                        confidence_threshold_val = 0.7
+                        n_clusters_val = 3
+                        
+                        # Try to get from sidebar widgets (if they exist)
+                        try:
+                            use_dispersion_val = use_dispersion
+                        except:
+                            pass
+                        
+                        try:
+                            use_ml_val = use_ml
+                        except:
+                            pass
+                        
+                        try:
+                            confidence_threshold_val = confidence_threshold
+                        except:
+                            pass
+                        
+                        try:
+                            n_clusters_val = n_clusters
+                        except:
+                            pass
                         
                         gas_prob, confidence = st.session_state.detector.multi_model_gas_detection(
                             use_dispersion=use_dispersion_val,
@@ -1235,7 +1281,13 @@ def main():
             
             # Show dashboard if analysis was run
             if st.session_state.analysis_run and st.session_state.detector is not None:
-                create_dashboard(st.session_state.detector)
+                # Get confidence threshold
+                try:
+                    confidence_threshold_val = confidence_threshold
+                except:
+                    confidence_threshold_val = 0.7
+                
+                create_dashboard(st.session_state.detector, confidence_threshold_val)
             
             # Show raw data preview if no analysis yet
             elif not st.session_state.analysis_run:
